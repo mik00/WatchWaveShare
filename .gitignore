@@ -1,0 +1,16 @@
+# Claude Code local settings
+.claude/
+
+# Arduino build output
+build/
+*.elf
+*.bin
+*.hex
+*.map
+
+# Arduino IDE
+*.bak
+
+# OS
+.DS_Store
+Thumbs.db
