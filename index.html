@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WatchWave</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #111;
+      color: #fff;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 40px 20px;
+      gap: 24px;
+    }
+
+    h1 {
+      font-size: 1.4rem;
+      letter-spacing: 4px;
+      color: #ccc;
+      font-weight: 300;
+    }
+
+    #status {
+      font-size: 0.85rem;
+      padding: 6px 16px;
+      border-radius: 20px;
+      background: #2a2a2a;
+      color: #888;
+      transition: all 0.3s;
+    }
+    #status.connected { background: #0a2a0a; color: #4caf50; }
+    #status.error     { background: #2a0a0a; color: #f44336; }
+
+    #connectBtn {
+      padding: 14px 36px;
+      border-radius: 10px;
+      border: none;
+      background: #2979ff;
+      color: #fff;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    #connectBtn:hover  { background: #448aff; }
+    #connectBtn:disabled { background: #333; color: #666; cursor: default; }
+
+    .send-row {
+      display: flex;
+      width: 100%;
+      max-width: 420px;
+      gap: 10px;
+    }
+
+    #messageInput {
+      flex: 1;
+      padding: 14px;
+      border-radius: 10px;
+      border: 1px solid #333;
+      background: #1e1e1e;
+      color: #fff;
+      font-size: 1rem;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    #messageInput:focus  { border-color: #2979ff; }
+    #messageInput:disabled { opacity: 0.3; }
+
+    #sendBtn {
+      padding: 14px 22px;
+      border-radius: 10px;
+      border: none;
+      background: #00c853;
+      color: #fff;
+      font-size: 1rem;
+      font-weight: 700;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    #sendBtn:hover    { background: #00e676; }
+    #sendBtn:disabled { background: #333; color: #666; cursor: default; }
+
+    #log {
+      width: 100%;
+      max-width: 420px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .log-entry {
+      font-size: 0.8rem;
+      color: #555;
+      padding: 4px 0;
+      border-bottom: 1px solid #1e1e1e;
+    }
+    .log-entry.sent { color: #2979ff; }
+  </style>
+</head>
+<body>
+
+  <h1>WATCHWAVE</h1>
+  <div id="status">Not connected</div>
+  <button id="connectBtn">Connect to Watch</button>
+
+  <div class="send-row">
+    <input id="messageInput" type="text" placeholder="Type a message..." disabled>
+    <button id="sendBtn" disabled>Send</button>
+  </div>
+
+  <div id="log"></div>
+
+  <script>
+    const NUS_SERVICE = '6e400001-b5b3-f393-e0a9-e50e24dcca9e';
+    const NUS_RX      = '6e400002-b5b3-f393-e0a9-e50e24dcca9e';
+
+    let rxChar = null;
+
+    const statusEl  = document.getElementById('status');
+    const connectBtn = document.getElementById('connectBtn');
+    const sendBtn   = document.getElementById('sendBtn');
+    const input     = document.getElementById('messageInput');
+    const log       = document.getElementById('log');
+
+    function setStatus(text, cls) {
+      statusEl.textContent = text;
+      statusEl.className = cls || '';
+    }
+
+    function addLog(text, cls) {
+      const el = document.createElement('div');
+      el.className = 'log-entry' + (cls ? ' ' + cls : '');
+      el.textContent = text;
+      log.prepend(el);
+    }
+
+    function setConnected(on) {
+      connectBtn.disabled = on;
+      sendBtn.disabled    = !on;
+      input.disabled      = !on;
+      if (on) input.focus();
+    }
+
+    connectBtn.addEventListener('click', async () => {
+      try {
+        setStatus('Scanning...');
+        const device = await navigator.bluetooth.requestDevice({
+          filters: [{ name: 'WatchWave' }],
+          optionalServices: [NUS_SERVICE]
+        });
+
+        setStatus('Connecting...');
+        device.addEventListener('gattserverdisconnected', () => {
+          rxChar = null;
+          setConnected(false);
+          setStatus('Disconnected');
+          addLog('Disconnected');
+        });
+
+        const server  = await device.gatt.connect();
+        const service = await server.getPrimaryService(NUS_SERVICE);
+        rxChar = await service.getCharacteristic(NUS_RX);
+
+        setConnected(true);
+        setStatus('Connected to WatchWave', 'connected');
+        addLog('Connected');
+      } catch (err) {
+        setStatus('Error: ' + err.message, 'error');
+      }
+    });
+
+    async function sendMessage() {
+      const text = input.value.trim();
+      if (!text || !rxChar) return;
+      try {
+        await rxChar.writeValue(new TextEncoder().encode(text));
+        addLog('→ ' + text, 'sent');
+        input.value = '';
+        input.focus();
+      } catch (err) {
+        setStatus('Send failed: ' + err.message, 'error');
+      }
+    }
+
+    sendBtn.addEventListener('click', sendMessage);
+    input.addEventListener('keydown', e => { if (e.key === 'Enter') sendMessage(); });
+  </script>
+
+</body>
+</html>
