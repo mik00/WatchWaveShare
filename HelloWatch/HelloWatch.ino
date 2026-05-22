@@ -18,12 +18,21 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include "TouchDrvFT6X36.hpp"
 
 #define NUS_SERVICE_UUID  "6E400001-B5B3-F393-E0A9-E50E24DCCA9E"
 #define NUS_RX_UUID       "6E400002-B5B3-F393-E0A9-E50E24DCCA9E"
 #define NUS_TX_UUID       "6E400003-B5B3-F393-E0A9-E50E24DCCA9E"
 
 HWCDC USBSerial;
+
+// ── Touch ──────────────────────────────────────────────────────────────────────
+TouchDrvFT6X36 touch;
+volatile bool touchDetected = false;
+
+void IRAM_ATTR onTouchInterrupt() {
+  touchDetected = true;
+}
 
 // ── Display ────────────────────────────────────────────────────────────────────
 Arduino_DataBus *bus = new Arduino_ESP32QSPI(
@@ -35,6 +44,7 @@ Arduino_GFX *gfx = new Arduino_CO5300(
   22 /* col_offset1 */, 0, 0, 0);
 
 // ── BLE state ──────────────────────────────────────────────────────────────────
+BLECharacteristic *pTxChar   = nullptr;
 volatile bool deviceConnected = false;
 volatile bool messageUpdated  = false;
 String pendingMessage = "";
@@ -99,6 +109,21 @@ void setup() {
   }
   drawScreen("Starting...", false);
 
+  // Touch init
+  Wire.begin(IIC_SDA, IIC_SCL);
+  pinMode(TP_RESET, OUTPUT);
+  digitalWrite(TP_RESET, LOW);
+  delay(10);
+  digitalWrite(TP_RESET, HIGH);
+  delay(50);
+  if (!touch.begin(Wire, FT6X36_SLAVE_ADDRESS, IIC_SDA, IIC_SCL)) {
+    USBSerial.println("Touch init failed");
+  } else {
+    USBSerial.println("Touch ready");
+    pinMode(TP_INT, INPUT_PULLUP);
+    attachInterrupt(TP_INT, onTouchInterrupt, FALLING);
+  }
+
   BLEDevice::init("WatchWave");
   // Random address forces Android GATT re-discovery on every connection,
   // avoiding stale cached characteristic handles from previous sessions.
@@ -109,7 +134,7 @@ void setup() {
 
   BLEService *pService = pServer->createService(NUS_SERVICE_UUID);
 
-  BLECharacteristic *pTxChar = pService->createCharacteristic(
+  pTxChar = pService->createCharacteristic(
     NUS_TX_UUID, BLECharacteristic::PROPERTY_NOTIFY);
   pTxChar->addDescriptor(new BLE2902());
 
@@ -130,10 +155,28 @@ void setup() {
 
 // ── Loop ───────────────────────────────────────────────────────────────────────
 void loop() {
+  if (touchDetected) {
+    touchDetected = false;
+    int16_t x, y;
+    if (touch.getPoint(&x, &y, 1)) {
+      USBSerial.printf("Touch: x=%d y=%d\n", x, y);
+      String msg = "Touch!\n(" + String(x) + ", " + String(y) + ")";
+      drawScreen(msg, deviceConnected);
+      if (deviceConnected && pTxChar) {
+        String notification = "touch:" + String(x) + "," + String(y);
+        pTxChar->setValue(notification.c_str());
+        pTxChar->notify();
+      }
+      delay(1500);
+      messageUpdated = true;
+    }
+  }
+
   if (messageUpdated) {
     messageUpdated = false;
     drawScreen(pendingMessage.isEmpty() ? "Send a message\nfrom the app!" : pendingMessage,
                deviceConnected);
   }
+
   delay(50);
 }
