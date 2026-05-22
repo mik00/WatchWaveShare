@@ -187,7 +187,7 @@
       const text = input.value.trim();
       if (!text || !rxChar) return;
       try {
-        await rxChar.writeValue(new TextEncoder().encode(text));
+        await rxChar.writeValueWithResponse(new TextEncoder().encode(text));
         addLog('→ ' + text, 'sent');
         input.value = '';
         input.focus();
