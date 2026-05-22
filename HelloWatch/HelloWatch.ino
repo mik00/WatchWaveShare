@@ -14,6 +14,7 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include "esp_log.h"
 
 // Nordic UART Service — recognised by Serial Bluetooth Terminal automatically
 #define NUS_SERVICE_UUID  "6E400001-B5B3-F393-E0A9-E50E24DCCA9E"
@@ -61,23 +62,31 @@ void drawScreen(const String &msg, bool connected) {
 // ── BLE callbacks ──────────────────────────────────────────────────────────────
 class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *) override {
+    USBSerial.println("BLE: phone connected");
     deviceConnected = true;
-    messageUpdated  = true;   // trigger redraw for status change
+    // deliberately NOT triggering drawScreen here — isolating display/BLE timing
   }
   void onDisconnect(BLEServer *pSrv) override {
+    USBSerial.println("BLE: phone disconnected");
     deviceConnected = false;
     messageUpdated  = true;
-    pSrv->startAdvertising();  // auto-restart advertising
+    pSrv->startAdvertising();
   }
 };
 
 class RxCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *pChar) override {
     String val = pChar->getValue();
+    USBSerial.print("BLE: onWrite fired, length=");
+    USBSerial.print(val.length());
+    USBSerial.print(", value='");
+    USBSerial.print(val);
+    USBSerial.println("'");
     if (val.length() > 0) {
       pendingMessage = val;
       pendingMessage.trim();
       messageUpdated = true;
+      USBSerial.println("BLE: messageUpdated set");
     }
   }
 };
@@ -85,6 +94,8 @@ class RxCallbacks : public BLECharacteristicCallbacks {
 // ── Setup ──────────────────────────────────────────────────────────────────────
 void setup() {
   USBSerial.begin(115200);
+  esp_log_level_set("BLE_GAP", ESP_LOG_DEBUG);
+  esp_log_level_set("BLE_GATTS", ESP_LOG_DEBUG);
 
 #ifdef GFX_EXTRA_PRE_INIT
   GFX_EXTRA_PRE_INIT();
@@ -129,6 +140,11 @@ void setup() {
 void loop() {
   if (messageUpdated) {
     messageUpdated = false;
+    USBSerial.print("loop: redrawing, connected=");
+    USBSerial.print(deviceConnected);
+    USBSerial.print(", msg='");
+    USBSerial.print(pendingMessage);
+    USBSerial.println("'");
     drawScreen(pendingMessage.isEmpty() ? "Send text from\nthe app!" : pendingMessage,
                deviceConnected);
   }

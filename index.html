@@ -118,6 +118,7 @@
   <script>
     const NUS_SERVICE = '6e400001-b5b3-f393-e0a9-e50e24dcca9e';
     const NUS_RX      = '6e400002-b5b3-f393-e0a9-e50e24dcca9e';
+    const NUS_TX      = '6e400003-b5b3-f393-e0a9-e50e24dcca9e';
 
     let rxChar = null;
 
@@ -165,6 +166,14 @@
         const server  = await device.gatt.connect();
         const service = await server.getPrimaryService(NUS_SERVICE);
         rxChar = await service.getCharacteristic(NUS_RX);
+
+        // Subscribe to TX notifications — keeps the connection alive on Android
+        const txChar = await service.getCharacteristic(NUS_TX);
+        await txChar.startNotifications();
+        txChar.addEventListener('characteristicvaluechanged', e => {
+          const msg = new TextDecoder().decode(e.target.value);
+          addLog('← ' + msg);
+        });
 
         setConnected(true);
         setStatus('Connected to WatchWave', 'connected');
