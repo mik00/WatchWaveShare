@@ -18,7 +18,6 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 #include "TouchDrvFT6X36.hpp"
-#include "fonts/FreeSans9pt7b.h"
 
 #define NUS_SERVICE_UUID  "6E400001-B5B3-F393-E0A9-E50E24DCCA9E"
 #define NUS_RX_UUID       "6E400002-B5B3-F393-E0A9-E50E24DCCA9E"
@@ -32,11 +31,12 @@
 #define WHITE 0xFFFF
 #endif
 
-// Display layout constants — FreeSans9pt7b
-#define LINE_H       30    // yAdvance=22 + 8px leading
-#define CHAR_W        6    // average px per glyph (proportional estimate)
-#define CHAR_DESCENT  4    // max descent below baseline
-#define LIST_START_Y 17    // first row baseline: top margin(5) + ascent(12)
+// Display layout constants — built-in glcdfont at textSize=2 (12x16 per char)
+#define LINE_H       18    // 16px tall + 2px leading
+#define CHAR_W       12    // 6px * textSize=2
+#define CHAR_DESCENT 16    // full char height, cursor is top-left in built-in font
+#define LIST_START_Y 73    // pushed down ~2 old rows from top
+#define DIST_COL_W   72    // right-column pixels reserved for up to 6-char distance at textSize=2
 #define MARGIN       10
 
 HWCDC USBSerial;
@@ -86,7 +86,7 @@ unsigned long  lastTouchMs   = 0;
 // so Arduino IDE doesn't auto-compile it. Then uncomment the three lines below.
 void debugFont() {
   // #include won't work here — include the font at file top, then:
-  // const GFXfont *testFont = &FreeSans9pt7b;  // ← your font
+  // const GFXfont *testFont = &FreeSans12pt7b;  // ← your font
   // For now this tests the coordinate path with the built-in font,
   // confirming text IS visible at various Y positions.
 
@@ -119,24 +119,16 @@ void debugFont() {
   USBSerial.printf("LCD %d x %d, LINE_H=%d VISIBLE_ROWS=%d\n",
     LCD_WIDTH, LCD_HEIGHT, LINE_H, VISIBLE_ROWS);
 
-  const GFXfont *f = &FreeSans9pt7b;
-  USBSerial.printf("Font ptr: %p  first=%d last=%d yAdvance=%d\n",
-    f, f->first, f->last, f->yAdvance);
-
   gfx->fillScreen(BLACK);
   gfx->fillRect(0, 80, LCD_WIDTH, 80, 0x001F);   // blue reference box y=80..160
-  gfx->setFont(f);
+  gfx->setTextSize(2);
   gfx->setTextColor(WHITE);
-  gfx->setCursor(10, 150);    // baseline at 150 → glyphs top at ~y=125
+  gfx->setCursor(10, 100);
   gfx->print("ABCabc 123");
 
   int16_t bx, by; uint16_t bw, bh;
-  gfx->getTextBounds("ABCabc 123", 10, 150, &bx, &by, &bw, &bh);
+  gfx->getTextBounds("ABCabc 123", 10, 100, &bx, &by, &bw, &bh);
   USBSerial.printf("Bounds: x=%d y=%d w=%d h=%d\n", bx, by, bw, bh);
-  // w==0 or h==0 → font not loaded
-  // by should be ~125 (inside the blue box)
-
-  gfx->setFont((const GFXfont*)nullptr);   // explicit cast avoids overload ambiguity
   delay(5000);
 }
 
@@ -165,7 +157,7 @@ void drawContactList(const String &payload) {
   gfx->fillScreen(BLACK);
   gfx->setTextWrap(false);
 
-  gfx->setFont(&FreeSans9pt7b);
+  gfx->setTextSize(2);
 
   int y = LIST_START_Y;
   int start = 0;
@@ -186,18 +178,19 @@ void drawContactList(const String &payload) {
         String dist = (sep >= 0) ? line.substring(sep + 2) : "";
         dist.trim();
 
-        int distPx  = dist.length() * CHAR_W + MARGIN;
-        int nameMax = (LCD_WIDTH - MARGIN - distPx) / CHAR_W;
+        int nameMax = (LCD_WIDTH - MARGIN - DIST_COL_W) / CHAR_W;
         if (nameMax > 0 && (int)name.length() > nameMax)
           name = name.substring(0, nameMax - 1) + "~";
 
-        gfx->setTextColor(WHITE);
+        gfx->setTextColor(WHITE, BLACK);
         gfx->setCursor(MARGIN, y);
         gfx->print(name);
 
         if (dist.length() > 0) {
-          int distX = LCD_WIDTH - (int)dist.length() * CHAR_W - MARGIN;
-          gfx->setTextColor(0x07FF);
+          int16_t bx, by; uint16_t bw, bh;
+          gfx->getTextBounds(dist, 0, y, &bx, &by, &bw, &bh);
+          int distX = LCD_WIDTH - MARGIN - (int)bw;
+          gfx->setTextColor(0x07FF, BLACK);
           gfx->setCursor(distX, y);
           gfx->print(dist);
         }
@@ -211,7 +204,6 @@ void drawContactList(const String &payload) {
     start = nl + 1;
   }
 
-  gfx->setFont((const GFXfont*)nullptr);
 }
 
 // ── BLE callbacks ──────────────────────────────────────────────────────────────
@@ -335,10 +327,10 @@ void loop() {
     drawContactList(contactList);
   }
 
-  // Connection status changes
+  // Connection status changes — only show status screen if no contact list is displayed
   if (messageUpdated) {
     messageUpdated = false;
-    if (!listReady) {  // don't overwrite a freshly drawn list
+    if (contactList.length() == 0) {
       drawScreen(
         deviceConnected ? "Loading contacts..." : "Open WhoDat\non your phone",
         deviceConnected
