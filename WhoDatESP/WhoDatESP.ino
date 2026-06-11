@@ -1020,10 +1020,10 @@ void drawWatchFace(bool fullRedraw) {
   char hhmm[6];
   snprintf(hhmm, sizeof(hhmm), "%02d:%02d", h, m);
   const int TS  = 7;
-  const int SS  = 3;
+  const int SECS_TS = 3;
   const int tw  = 5 * TS * 6;          // HH:MM width
   const int th  = TS * 8;
-  const int ssW = 3 * SS * 6;          // :SS width (3 chars × 18px)
+  const int ssW = 3 * SECS_TS * 6;     // :SS width (3 chars × 18px)
   const int tx  = (LCD_WIDTH - (tw + 2 + ssW)) / 2;  // centre combined string
   const int ty  = TIME_Y;
   gfx->setTextSize(TS);
@@ -1033,9 +1033,9 @@ void drawWatchFace(bool fullRedraw) {
 
   char secs[4];
   snprintf(secs, sizeof(secs), ":%02d", s);
-  gfx->setTextSize(SS);
+  gfx->setTextSize(SECS_TS);
   gfx->setTextColor(0x8410, BLACK);
-  gfx->setCursor(tx + tw + 2, ty + th - SS * 8);
+  gfx->setCursor(tx + tw + 2, ty + th - SECS_TS * 8);
   gfx->print(secs);
 
   // Connection indicator — green dot when BLE connected, red when not
