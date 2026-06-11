@@ -120,6 +120,7 @@ void fillCircleFixed(int16_t cx, int16_t cy, int16_t r, uint16_t color) {
 BLECharacteristic *pTxChar    = nullptr;
 volatile bool deviceConnected = false;
 volatile bool messageUpdated  = false;
+volatile unsigned long bleConnectMs = 0;  // millis() of last onConnect; gates post-connect awake grace period
 int           lostSeconds     = 0;      // beep if disconnected for this many seconds (0=off)
 unsigned long lostTimerStartMs = 0;     // millis() at disconnect; 0 = timer inactive
 
@@ -163,6 +164,9 @@ unsigned long  findFeedbackMs = 0;
 #define TOUCH_RELEASE_MS 120   // ms silence = finger lifted
 #define DOUBLE_TAP_MS    400   // max gap between taps to count as double-tap
 #define SLEEP_MS         30000 // light sleep after this many ms with no touch
+#define BLE_POLL_MS        500 // periodic wake while asleep, to keep BLE responsive
+#define BLE_HANDSHAKE_GRACE_MS 3000 // stay fully awake this long after a new BLE connection,
+                                    // so MTU/service-discovery/CCCD handshake isn't interrupted by sleep
 #define PWR_DOUBLETAP_MS 500   // max ms between button presses for double-press power-off
 unsigned long  lastTapMs       = 0;
 bool           screenOn        = true;
@@ -231,6 +235,30 @@ void rtcGetDate(int &wday, int &day, int &mon, int &yr) {
   wday = Wire.read() & 0x07;
   mon  = rtcFromBCD(Wire.read() & 0x1F);
   yr   = rtcFromBCD(Wire.read()) + 2000;
+}
+
+// Returns Unix epoch seconds from the RTC (valid after rtcSet() syncs from phone).
+uint32_t rtcEpochSec() {
+  Wire.beginTransmission(RTC_ADDR);
+  Wire.write(0x04);  // PCF85063A: Seconds at 0x04
+  Wire.endTransmission(false);
+  Wire.requestFrom((uint8_t)RTC_ADDR, (uint8_t)7);
+  if (Wire.available() < 7) return 0;
+  uint8_t r[7];
+  for (int i = 0; i < 7; i++) r[i] = Wire.read();
+  int sec = rtcFromBCD(r[0] & 0x7F);
+  int min = rtcFromBCD(r[1] & 0x7F);
+  int hr  = rtcFromBCD(r[2] & 0x3F);
+  int day = rtcFromBCD(r[3] & 0x3F);
+  // r[4] = weekday, skip
+  int mon = rtcFromBCD(r[5] & 0x1F);
+  int yr  = rtcFromBCD(r[6]) + 2000;
+  // Civil-to-epoch: treat March as month 0 of the year to simplify leap-year handling.
+  int y = yr, m = mon;
+  if (m <= 2) { y--; m += 9; } else { m -= 3; }
+  uint32_t days = (uint32_t)(365L * y + y/4 - y/100 + y/400
+                              + (153*m + 2)/5 + day - 719469L);
+  return days * 86400UL + (uint32_t)hr * 3600UL + (uint32_t)min * 60UL + (uint32_t)sec;
 }
 
 void rtcGet(int &h, int &m, int &s) {
@@ -574,35 +602,40 @@ int     buyScrollOffset    = 0;
 int     buyHighlightIdx    = -1;   // index of item currently under finger (-1 = none)
 int16_t buyDragBaseY       = -1;   // Y at touch-down for real-time scroll; -1 = not dragging
 int     buyDragStartOffset = 0;    // buyScrollOffset at touch-down
-bool buyItemBought[MAX_BUY_ITEMS];
+bool     buyItemBought[MAX_BUY_ITEMS];
+uint32_t buyItemTimestamp[MAX_BUY_ITEMS];  // epoch seconds; 0 = not locally edited
 bool buyLoading       = false;
 
-// Sort: need items (bought=false) alphabetically first, bought items alphabetically second.
+// Sort: checked/Buy items (bought=true) alphabetically first, unchecked/Maybe items second.
+// buyNeedCount = number of checked (Buy) items = first buyNeedCount entries in buyItems[].
 void repartitionBuyItems() {
-  // Insertion sort by (bought ASC, name ASC) — list is tiny so O(n²) is fine
+  // Insertion sort by (bought DESC, name ASC) — checked items at top
   for (int i = 1; i < buyItemCount; i++) {
     char keyName[BUY_LINE_LEN + 1];
-    bool keyBought = buyItemBought[i];
+    bool     keyBought = buyItemBought[i];
+    uint32_t keyTs     = buyItemTimestamp[i];
     strncpy(keyName, buyItems[i], BUY_LINE_LEN);
     keyName[BUY_LINE_LEN] = '\0';
     int j = i - 1;
     while (j >= 0) {
       bool swap;
       if (buyItemBought[j] != keyBought)
-        swap = buyItemBought[j] && !keyBought;       // bought before need → swap
+        swap = !buyItemBought[j] && keyBought;       // unchecked before checked → swap
       else
         swap = strcasecmp(buyItems[j], keyName) > 0; // same group, wrong alpha → swap
       if (!swap) break;
       strncpy(buyItems[j + 1], buyItems[j], BUY_LINE_LEN);
-      buyItemBought[j + 1] = buyItemBought[j];
+      buyItemBought[j + 1]    = buyItemBought[j];
+      buyItemTimestamp[j + 1] = buyItemTimestamp[j];
       j--;
     }
     strncpy(buyItems[j + 1], keyName, BUY_LINE_LEN);
-    buyItemBought[j + 1] = keyBought;
+    buyItemBought[j + 1]    = keyBought;
+    buyItemTimestamp[j + 1] = keyTs;
   }
   buyNeedCount = 0;
   for (int i = 0; i < buyItemCount; i++)
-    if (!buyItemBought[i]) buyNeedCount++;
+    if (buyItemBought[i]) buyNeedCount++;
 }
 
 // textSize(4) for buy list items: 24px/char wide, 32px tall, 36px per row
@@ -617,17 +650,26 @@ void drawCheckmark(int x, int y, uint16_t color) {
   }
 }
 
+// 2px-thick empty square box in a 16×16px area with top-left at (x, y) — unchecked indicator
+void drawEmptyBox(int x, int y, uint16_t color) {
+  gfx->drawRect(x,     y,     16, 16, color);
+  gfx->drawRect(x + 1, y + 1, 14, 14, color);
+}
+
 void drawBuyList() {
   gfx->fillScreen(BLACK);
   gfx->setFont(nullptr);
   gfx->setTextWrap(false);
 
-  // Header — textSize(2), green
+  // Header — "Buy" left (green), "Maybe" right (grey)
   gfx->setTextSize(2);
-  gfx->setTextColor(0x07E0, BLACK);
-  const char* hdr = "-- SHOPPING --";
-  gfx->setCursor((LCD_WIDTH - (int)strlen(hdr) * 12) / 2, MARGIN + 4);
-  gfx->print(hdr);
+  gfx->setTextColor(WHITE, BLACK);
+  gfx->setCursor(MARGIN + 4, MARGIN + 4);
+  gfx->print("Buy");
+  gfx->setTextColor(0x8410, BLACK);
+  int mhw = 5 * 12;  // "Maybe" at textSize(2) = 5 chars * 12px
+  gfx->setCursor(LCD_WIDTH - mhw - MARGIN, MARGIN + 4);
+  gfx->print("Maybe");
 
   if (buyItemCount == 0) {
     gfx->setTextColor(0x8410, BLACK);
@@ -657,16 +699,18 @@ void drawBuyList() {
     }
     bool hl     = (i == buyHighlightIdx);
     bool bought = buyItemBought[i];
-    // Separator line at top of bought section
-    if (i == buyNeedCount && buyNeedCount > 0 && buyNeedCount < buyItemCount)
+    // Separator + "Maybe" label at start of unchecked section
+    if (i == buyNeedCount && buyNeedCount < buyItemCount) {
       gfx->drawFastHLine(0, y, LCD_WIDTH, 0x4208);
+    }
     if (hl) {
       gfx->fillRect(0, y, LCD_WIDTH, BUY_ITEM_H, WHITE);
       gfx->setTextColor(BLACK, WHITE);
     } else {
-      gfx->setTextColor(bought ? 0x8410 : WHITE, BLACK);
+      gfx->setTextColor(bought ? WHITE : 0x8410, BLACK);
     }
     if (bought) drawCheckmark(safeL + 2, y + (BUY_ITEM_H - 20) / 2, hl ? 0x0320 : 0x07E0);
+    else        drawEmptyBox(safeL + 2, y + (BUY_ITEM_H - 16) / 2, hl ? BLACK : 0x4208);
     gfx->setCursor(safeL + CHKMARK_W, y);
     gfx->print(buyItems[i]);
     y += BUY_ITEM_H;
@@ -683,12 +727,12 @@ void drawBuyList() {
     gfx->print(ind);
   }
 
-  // Three buttons: Need | List | Back
+  // Three buttons: Buy | Maybe | Back
   gfx->setFont(nullptr); gfx->setTextWrap(false); gfx->setTextSize(2);
-  static const char* const BUY_BTN_LABELS[3] = { "Need", "List", "Back" };
+  static const char* const BUY_BTN_LABELS[3] = { "Buy", "Maybe", "Back" };
   for (int i = 0; i < 3; i++) {
     int bx = menuBtnX(i);
-    uint16_t fill = (i == 0 && buyNeedCount > 0) ? PINK : 0x4208;
+    uint16_t fill = 0x4208;
     gfx->fillRoundRect(bx, BTN_Y, BTN_W, BTN_H, 8, fill);
     gfx->drawRoundRect(bx,     BTN_Y,     BTN_W,     BTN_H,     8, WHITE);
     gfx->drawRoundRect(bx + 1, BTN_Y + 1, BTN_W - 2, BTN_H - 2, 7, 0xC618);
@@ -728,9 +772,10 @@ void drawBuyItem(int idx, bool highlighted) {
     gfx->setTextColor(BLACK, WHITE);
   } else {
     gfx->fillRect(0, y, LCD_WIDTH, BUY_ITEM_H, BLACK);
-    gfx->setTextColor(bought ? 0x8410 : WHITE, BLACK);
+    gfx->setTextColor(bought ? WHITE : 0x8410, BLACK);
   }
   if (bought) drawCheckmark(safeL + 2, y + (BUY_ITEM_H - 20) / 2, highlighted ? 0x0320 : 0x07E0);
+  else        drawEmptyBox(safeL + 2, y + (BUY_ITEM_H - 16) / 2, highlighted ? BLACK : 0x4208);
   gfx->setCursor(safeL + CHKMARK_W, y);
   gfx->print(buyItems[idx]);
 }
@@ -1059,6 +1104,7 @@ void drawWatchFace(bool fullRedraw) {
         line.trim();
         start = nl + 1;
         if (line.length() == 0) continue;
+        if (line.startsWith("BUY:") || line.startsWith("GOT:") || line.startsWith("HOME:")) continue;
         int sep = line.indexOf('|');
         if (sep < 0) continue;
         String name = line.substring(0, sep);
@@ -1267,6 +1313,7 @@ class ServerCallbacks : public BLEServerCallbacks {
     USBSerial.println("BLE: connected");
     deviceConnected = true;
     messageUpdated  = true;
+    bleConnectMs    = millis();
   }
   void onDisconnect(BLEServer *pSrv) override {
     USBSerial.println("BLE: disconnected");
@@ -1484,13 +1531,21 @@ void setup() {
         int nl = buyStr.indexOf('\n', bstart);
         String token = (nl < 0) ? buyStr.substring(bstart) : buyStr.substring(bstart, nl);
         if (token.startsWith("BUY:") || token.startsWith("GOT:")) {
-          bool isBought = token.startsWith("GOT:");
+          bool isBought = token.startsWith("BUY:");
           String item = token.substring(4);
           item.trim();
+          uint32_t ts = 0;
+          int pipe = item.indexOf('|');
+          if (pipe >= 0) {
+            ts   = (uint32_t)item.substring(pipe + 1).toInt();
+            item = item.substring(0, pipe);
+            item.trim();
+          }
           if (item.length() > 0) {
             item.toCharArray(buyItems[buyItemCount], sizeof(buyItems[buyItemCount]));
-            buyItemBought[buyItemCount] = isBought;
-            if (!isBought) buyNeedCount++;
+            buyItemBought[buyItemCount]    = isBought;
+            buyItemTimestamp[buyItemCount] = ts;
+            if (isBought) buyNeedCount++;
             buyItemCount++;
           }
         }
@@ -1586,6 +1641,42 @@ void setup() {
   screenActivityMs = millis();  // start inactivity countdown from end of boot
 }
 
+// Apply parsed time content "HH:MM:SS|WD|DD|MM|YYYY" to RTC and NVS.
+static void applyTimeContent(const String &ts) {
+  int ph = ts.substring(0, 2).toInt();
+  int pm = ts.substring(3, 5).toInt();
+  int ps = ts.substring(6, 8).toInt();
+  int pWday = -1, pDay = -1, pMon = -1, pYr = -1;
+  int p1 = ts.indexOf('|');
+  if (p1 >= 0) {
+    int p2 = ts.indexOf('|', p1 + 1);
+    int p3 = (p2 >= 0) ? ts.indexOf('|', p2 + 1) : -1;
+    int p4 = (p3 >= 0) ? ts.indexOf('|', p3 + 1) : -1;
+    if (p2 >= 0 && p3 >= 0 && p4 >= 0) {
+      pWday = ts.substring(p1 + 1, p2).toInt();
+      pDay  = ts.substring(p2 + 1, p3).toInt();
+      pMon  = ts.substring(p3 + 1, p4).toInt();
+      pYr   = ts.substring(p4 + 1).toInt();
+    }
+  }
+  rtcSet(ph, pm, ps, pWday, pDay, pMon, pYr);
+  Preferences prefs;
+  prefs.begin("whodat", false);
+  prefs.putInt("h", ph); prefs.putInt("m", pm); prefs.putInt("s", ps);
+  prefs.end();
+  USBSerial.printf("Time sync: %02d:%02d:%02d\n", ph, pm, ps);
+}
+
+// Parses and applies a leading TIME:HH:MM:SS|WD|DD|MM|YYYY line from 'data', advancing
+// past it. Does NOT set watchFaceFullRedraw — caller decides whether the face needs it.
+static void applyTimeLineIfPresent(String &data) {
+  if (!data.startsWith("TIME:")) return;
+  int nl = data.indexOf('\n');
+  if (nl < 0) return;
+  applyTimeContent(data.substring(5, nl));
+  data = data.substring(nl + 1);
+}
+
 // ── Loop ───────────────────────────────────────────────────────────────────────
 void loop() {
   // Button monitoring — single press = restart, double press = power off
@@ -1652,6 +1743,17 @@ void loop() {
             buyDragBaseY       = (ty >= LIST_START_Y) ? ty : -1;
             buyDragStartOffset = buyScrollOffset;
             if (buyHighlightIdx >= 0) drawBuyItem(buyHighlightIdx, true);
+          }
+        } else if (currentMode == MODE_BUY_LIST && buyDragBaseY >= 0) {
+          // Real-time scroll during drag
+          const int maxVis = (LCD_HEIGHT - BTN_H - 8 - LIST_START_Y) / BUY_ITEM_H;
+          int dragDelta = (int)buyDragBaseY - (int)ty;  // positive = dragged up = scroll forward
+          int newOff = constrain(buyDragStartOffset + dragDelta / (BUY_ITEM_H / 2),
+                                 0, max(0, buyItemCount - maxVis));
+          if (newOff != buyScrollOffset) {
+            buyScrollOffset = newOff;
+            buyHighlightIdx = -1;
+            drawBuyList();
           }
         }
         touchLastX  = tx; touchLastY  = ty;
@@ -1796,19 +1898,8 @@ void loop() {
       //   tap              — all movement <= 15px
       //   (horizontal swipe kept for legacy; deltaX dominant and > SWIPE_THRESHOLD)
       if (abs(deltaY) > 15 && abs(deltaY) >= abs(deltaX)) {
-        // Vertical gesture — always scroll 9 items in direction of swipe
-        if (buyDragBaseY >= 0) {
-          int jump = (deltaY < 0) ? 9 : -9;  // flick up (deltaY<0) → increase offset (lower items); flick down → decrease
-          int newOff = constrain(buyDragStartOffset + jump, 0, max(0, buyItemCount - maxVisible));
-          if (newOff != buyScrollOffset) {
-            buyScrollOffset = newOff;
-            drawBuyList();
-          } else if (prevBuyHL >= 0) {
-            drawBuyItem(prevBuyHL, false);
-          }
-        } else if (prevBuyHL >= 0) {
-          drawBuyItem(prevBuyHL, false);
-        }
+        // Scroll gesture finished — real-time already positioned the list, just clear highlight
+        if (prevBuyHL >= 0 && prevBuyHL < buyItemCount) drawBuyItem(prevBuyHL, false);
       } else {
         // Tap — buttons, or toggle item
         int btn = -1;
@@ -1830,13 +1921,17 @@ void loop() {
           lastWatchSecond     = -1;
         } else if (prevBuyHL >= 0 && prevBuyHL < buyItemCount) {
           // Tap on item — toggle bought state
+          uint32_t now = rtcEpochSec();
+          buyItemBought[prevBuyHL]    = !buyItemBought[prevBuyHL];
+          buyItemTimestamp[prevBuyHL] = now;
           if (deviceConnected && pTxChar) {
             String tickMsg = "TICK:";
             tickMsg += buyItems[prevBuyHL];
+            tickMsg += '|';
+            tickMsg += now;
             pTxChar->setValue(tickMsg.c_str());
             pTxChar->notify();
           }
-          buyItemBought[prevBuyHL] = !buyItemBought[prevBuyHL];
           repartitionBuyItems();
           if (buyScrollOffset > 0 && buyScrollOffset >= buyItemCount)
             buyScrollOffset = max(0, buyItemCount - maxVisible);
@@ -1874,38 +1969,95 @@ void loop() {
       gfx->displayOn();
     }
 
-    // ── BUYDATA response (on-demand, from Buy button) ──────────────────────────
+    // ── Quick clock sync sent immediately on BLE connect ─────────────────────────
+    if (contactList.startsWith("TIMESYNC:")) {
+      applyTimeContent(contactList.substring(9));
+      watchFaceFullRedraw = true;
+      lastWatchSecond = -1;
+      goto listReadyDone;
+    }
+
+    // ── BUYDATA response (on-demand, from Buy button / TICK reply) ───────────────
     if (contactList.startsWith("BUYDATA\n")) {
-      String buyData = contactList.substring(8);  // local copy — contactList preserved
-      buyItemCount = 0;
-      buyNeedCount = 0;
-      buyLoading   = false;
-      while (buyData.startsWith("BUY:") || buyData.startsWith("GOT:")) {
-        bool isBought = buyData.startsWith("GOT:");
+      buyLoading = false;
+      // Parse incoming items into temp arrays, then merge with local state.
+      // Local items with a newer timestamp (localTs > 0 && localTs >= incomingTs)
+      // are preserved; all other items take the incoming state.
+      static char     inName[MAX_BUY_ITEMS][BUY_LINE_LEN + 1];
+      static bool     inBought[MAX_BUY_ITEMS];
+      static uint32_t inTs[MAX_BUY_ITEMS];
+      int inCount = 0;
+      String buyData = contactList.substring(8);
+      applyTimeLineIfPresent(buyData);  // sync clock on every BUYDATA response
+      while ((buyData.startsWith("BUY:") || buyData.startsWith("GOT:")) && inCount < MAX_BUY_ITEMS) {
+        bool isBought = buyData.startsWith("BUY:");
         int nl = buyData.indexOf('\n');
         if (nl < 0) break;
-        String item = buyData.substring(4, nl);
-        item.trim();
-        if (item.length() > 0 && buyItemCount < MAX_BUY_ITEMS) {
-          item.toCharArray(buyItems[buyItemCount], sizeof(buyItems[buyItemCount]));
-          buyItemBought[buyItemCount] = isBought;
-          if (!isBought) buyNeedCount++;
-          buyItemCount++;
+        String raw = buyData.substring(4, nl);
+        raw.trim();
+        uint32_t ts = 0;
+        int pipe = raw.indexOf('|');
+        if (pipe >= 0) {
+          ts  = (uint32_t)raw.substring(pipe + 1).toInt();
+          raw = raw.substring(0, pipe);
+          raw.trim();
+        }
+        if (raw.length() > 0) {
+          raw.toCharArray(inName[inCount], sizeof(inName[inCount]));
+          inBought[inCount] = isBought;
+          inTs[inCount]     = ts;
+          inCount++;
         }
         buyData = buyData.substring(nl + 1);
       }
-      lastInteractionMs = millis();  // keep screen alive after slow Keep fetch
+      // Build merged list (incoming order, local state wins where local is newer)
+      static char     newName[MAX_BUY_ITEMS][BUY_LINE_LEN + 1];
+      static bool     newBought[MAX_BUY_ITEMS];
+      static uint32_t newTs[MAX_BUY_ITEMS];
+      int newCount = 0;
+      for (int ii = 0; ii < inCount; ii++) {
+        bool useLocal = false;
+        for (int li = 0; li < buyItemCount; li++) {
+          if (strcasecmp(buyItems[li], inName[ii]) == 0) {
+            if (buyItemTimestamp[li] > 0 && buyItemTimestamp[li] >= inTs[ii]) {
+              strncpy(newName[newCount], buyItems[li], BUY_LINE_LEN);
+              newName[newCount][BUY_LINE_LEN] = '\0';
+              newBought[newCount] = buyItemBought[li];
+              newTs[newCount]     = buyItemTimestamp[li];
+              useLocal = true;
+            }
+            break;
+          }
+        }
+        if (!useLocal) {
+          strncpy(newName[newCount], inName[ii], BUY_LINE_LEN);
+          newName[newCount][BUY_LINE_LEN] = '\0';
+          newBought[newCount] = inBought[ii];
+          newTs[newCount]     = inTs[ii];
+        }
+        newCount++;
+      }
+      buyItemCount = newCount;
+      for (int i = 0; i < buyItemCount; i++) {
+        strncpy(buyItems[i], newName[i], BUY_LINE_LEN);
+        buyItems[i][BUY_LINE_LEN] = '\0';
+        buyItemBought[i]    = newBought[i];
+        buyItemTimestamp[i] = newTs[i];
+      }
+      repartitionBuyItems();
+      lastInteractionMs = millis();
       if (buyItemCount > 0 && currentMode != MODE_BUY_LIST) {
-        // Inactivity timed out before BUYDATA arrived — reopen the list
         currentMode = MODE_BUY_LIST;
       }
       if (currentMode == MODE_BUY_LIST) drawBuyList();
-      // Cache to NVS (full-payload block is skipped by goto)
+      // Cache to NVS with timestamps (full-payload block is skipped by goto)
       if (buyItemCount > 0) {
         String buyStr = "";
         for (int i = 0; i < buyItemCount; i++) {
-          buyStr += buyItemBought[i] ? "GOT:" : "BUY:";
+          buyStr += buyItemBought[i] ? "BUY:" : "GOT:";
           buyStr += buyItems[i];
+          buyStr += '|';
+          buyStr += buyItemTimestamp[i];
           buyStr += '\n';
         }
         Preferences prefs;
@@ -1920,40 +2072,9 @@ void loop() {
     scrollOffset = 0;
     // Parse leading TIME:HH:MM:SS|WD|DD|MM|YYYY line and sync PCF85063
     if (contactList.startsWith("TIME:")) {
-      int nl = contactList.indexOf('\n');
-      if (nl >= 0) {
-        String ts = contactList.substring(5, nl);
-        int ph = ts.substring(0, 2).toInt();
-        int pm = ts.substring(3, 5).toInt();
-        int ps = ts.substring(6, 8).toInt();
-        // Optional date fields: |WD|DD|MM|YYYY
-        int pWday = -1, pDay = -1, pMon = -1, pYr = -1;
-        int p1 = ts.indexOf('|');
-        if (p1 >= 0) {
-          int p2 = ts.indexOf('|', p1+1);
-          int p3 = ts.indexOf('|', p2+1);
-          int p4 = ts.indexOf('|', p3+1);
-          if (p2 >= 0 && p3 >= 0 && p4 >= 0) {
-            pWday = ts.substring(p1+1, p2).toInt();
-            pDay  = ts.substring(p2+1, p3).toInt();
-            pMon  = ts.substring(p3+1, p4).toInt();
-            pYr   = ts.substring(p4+1).toInt();
-          }
-        }
-        rtcSet(ph, pm, ps, pWday, pDay, pMon, pYr);
-        watchFaceFullRedraw = true;
-        lastWatchSecond = -1;
-        {
-          Preferences prefs;
-          prefs.begin("whodat", false);
-          prefs.putInt("h", ph);
-          prefs.putInt("m", pm);
-          prefs.putInt("s", ps);
-          prefs.end();
-        }
-        USBSerial.printf("Time from phone: %02d:%02d:%02d\n", ph, pm, ps);
-        contactList = contactList.substring(nl + 1);
-      }
+      applyTimeLineIfPresent(contactList);
+      watchFaceFullRedraw = true;
+      lastWatchSecond = -1;
     }
 
     // Parse WEATHER:CCCC...:T0,T1,... line
@@ -2012,22 +2133,57 @@ void loop() {
       }
     }
 
-    // Parse BUY:item (need) and GOT:item (bought) lines from Android
-    buyItemCount = 0;
-    buyNeedCount = 0;
-    while (contactList.startsWith("BUY:") || contactList.startsWith("GOT:")) {
-      bool isBought = contactList.startsWith("GOT:");
-      int nl = contactList.indexOf('\n');
-      if (nl < 0) break;
-      String item = contactList.substring(4, nl);
-      item.trim();
-      if (item.length() > 0 && buyItemCount < MAX_BUY_ITEMS) {
-        item.toCharArray(buyItems[buyItemCount], sizeof(buyItems[buyItemCount]));
-        buyItemBought[buyItemCount] = isBought;
-        if (!isBought) buyNeedCount++;
-        buyItemCount++;
+    // Parse BUY:/GOT: lines from Android — merge with local state by timestamp
+    {
+      // Save current local list before reset so we can preserve newer local edits
+      static char     savedName[MAX_BUY_ITEMS][BUY_LINE_LEN + 1];
+      static bool     savedBought[MAX_BUY_ITEMS];
+      static uint32_t savedTs[MAX_BUY_ITEMS];
+      int savedCount = buyItemCount;
+      for (int i = 0; i < savedCount; i++) {
+        strncpy(savedName[i], buyItems[i], BUY_LINE_LEN + 1);
+        savedBought[i] = buyItemBought[i];
+        savedTs[i]     = buyItemTimestamp[i];
       }
-      contactList = contactList.substring(nl + 1);
+      buyItemCount = 0;
+      buyNeedCount = 0;
+      while (contactList.startsWith("BUY:") || contactList.startsWith("GOT:")) {
+        bool isBought = contactList.startsWith("BUY:");
+        int nl = contactList.indexOf('\n');
+        if (nl < 0) break;
+        String raw = contactList.substring(4, nl);
+        raw.trim();
+        uint32_t inTs = 0;
+        int pipe = raw.indexOf('|');
+        if (pipe >= 0) {
+          inTs = (uint32_t)raw.substring(pipe + 1).toInt();
+          raw  = raw.substring(0, pipe);
+          raw.trim();
+        }
+        if (raw.length() > 0 && buyItemCount < MAX_BUY_ITEMS) {
+          bool useLocal = false;
+          for (int li = 0; li < savedCount; li++) {
+            if (strcasecmp(savedName[li], raw.c_str()) == 0) {
+              if (savedTs[li] > 0 && savedTs[li] >= inTs) {
+                strncpy(buyItems[buyItemCount], savedName[li], BUY_LINE_LEN);
+                buyItems[buyItemCount][BUY_LINE_LEN] = '\0';
+                buyItemBought[buyItemCount]    = savedBought[li];
+                buyItemTimestamp[buyItemCount] = savedTs[li];
+                useLocal = true;
+              }
+              break;
+            }
+          }
+          if (!useLocal) {
+            raw.toCharArray(buyItems[buyItemCount], sizeof(buyItems[buyItemCount]));
+            buyItemBought[buyItemCount]    = isBought;
+            buyItemTimestamp[buyItemCount] = inTs;
+          }
+          if (buyItemBought[buyItemCount]) buyNeedCount++;
+          buyItemCount++;
+        }
+        contactList = contactList.substring(nl + 1);
+      }
     }
     if (buyItemCount > 0) watchFaceFullRedraw = true;
 
@@ -2084,8 +2240,10 @@ void loop() {
       if (buyItemCount > 0) {
         String buyStr = "";
         for (int i = 0; i < buyItemCount; i++) {
-          buyStr += buyItemBought[i] ? "GOT:" : "BUY:";
+          buyStr += buyItemBought[i] ? "BUY:" : "GOT:";
           buyStr += buyItems[i];
+          buyStr += '|';
+          buyStr += buyItemTimestamp[i];
           buyStr += '\n';
         }
         prefs.putInt("buycnt", buyItemCount);
@@ -2111,9 +2269,13 @@ void loop() {
   if (screenOn && millis() - screenActivityMs > SLEEP_MS) {
     gfx->displayOff();
     screenOn = false;
+  }
+
+  if (!screenOn && millis() - bleConnectMs > BLE_HANDSHAKE_GRACE_MS) {
     gpio_wakeup_enable((gpio_num_t)TP_INT, GPIO_INTR_LOW_LEVEL);
     esp_sleep_enable_gpio_wakeup();
-    esp_light_sleep_start();  // returns on touch; ISR sets touchDetected
+    esp_sleep_enable_timer_wakeup(BLE_POLL_MS * 1000ULL);
+    esp_light_sleep_start();  // returns on touch, or every BLE_POLL_MS to service BLE
   }
 
   // Watch face — redraw once per second (millis-based; avoids stall if RTC I2C hiccups)
