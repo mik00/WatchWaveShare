@@ -2276,6 +2276,9 @@ void loop() {
     esp_sleep_enable_gpio_wakeup();
     esp_sleep_enable_timer_wakeup(BLE_POLL_MS * 1000ULL);
     esp_light_sleep_start();  // returns on touch, or every BLE_POLL_MS to service BLE
+    // I2C peripheral state can be left stale across light sleep; re-init so
+    // rtcGet()/AXP2101 reads return live data instead of pre-sleep cached bytes.
+    Wire.begin(IIC_SDA, IIC_SCL);
   }
 
   // Watch face — redraw once per second (millis-based; avoids stall if RTC I2C hiccups)
@@ -2352,12 +2355,18 @@ void loop() {
       prefs.end();
       Wire.beginTransmission(AXP2101_ADDR);
       Wire.write(0xA4);
-      if (Wire.endTransmission(false) == 0) {
+      uint8_t txStatus = Wire.endTransmission(false);
+      if (txStatus == 0) {
         Wire.requestFrom((uint8_t)AXP2101_ADDR, (uint8_t)1);
         if (Wire.available()) {
           uint8_t v = Wire.read();
+          USBSerial.printf("Batt poll: reg0xA4=%u cachedBattPct=%u -> %u\n", v, cachedBattPct, (v <= 100) ? v : cachedBattPct);
           if (v <= 100) cachedBattPct = v;
+        } else {
+          USBSerial.println("Batt poll: requestFrom returned no data");
         }
+      } else {
+        USBSerial.printf("Batt poll: I2C endTransmission failed, status=%u\n", txStatus);
       }
     }
   }
