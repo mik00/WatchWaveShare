@@ -68,6 +68,7 @@ HWCDC USBSerial;
 // ── PMIC ───────────────────────────────────────────────────────────────────────
 #define AXP2101_ADDR 0x34
 uint8_t cachedBattPct = 0xFF;  // 0xFF = not yet read
+bool    usbPowered    = false; // true when VBUS present (USB cable plugged in)
 
 // ── IMU ────────────────────────────────────────────────────────────────────────
 SensorQMI8658  imu;
@@ -178,7 +179,8 @@ unsigned long  screenActivityMs = 0;
 enum WatchMode { MODE_WATCH_FACE, MODE_CONTACT_LIST, MODE_TAKE_LIST, MODE_BUY_LIST, MODE_CAL_LIST };
 WatchMode     currentMode         = MODE_WATCH_FACE;
 static uint32_t calAlertedMask    = 0;   // bit i = event[i] alerted today
-bool          watchFaceFullRedraw = true;
+bool          watchFaceFullRedraw  = true;
+unsigned long syncFlashMs         = 0;     // millis() of last sync; 0 = none
 int           lastWatchSecond     = -1;
 unsigned long lastInteractionMs   = 0;
 #define INACTIVITY_MS 10000
@@ -1038,8 +1040,35 @@ void drawWatchFace(bool fullRedraw) {
   gfx->setCursor(tx + tw + 2, ty + th - SECS_TS * 8);
   gfx->print(secs);
 
-  // Connection indicator — green dot when BLE connected, red when not
-  fillCircleFixed(tx / 2, ty + th / 2, 10, deviceConnected ? 0x07E0 : 0xF800);
+  // Single connection/sync indicator: red blob=disconnected, green blob=connected,
+  // green arrow=sync in progress (fades to blob when done).
+  {
+    const int icX = tx / 2;
+    const int icY = ty + th / 2;
+    bool showArrow = false;
+    uint16_t arrowCol = BLACK;
+    if (syncFlashMs > 0) {
+      unsigned long el = millis() - syncFlashMs;
+      if      (el < 1500) { showArrow = true; arrowCol = 0x07E0; }   // green
+      else if (el < 3000) { showArrow = true; arrowCol = 0x0320; }   // dim green
+      else                  syncFlashMs = 0;
+    }
+    if (showArrow) {
+      fillCircleFixed(icX, icY, 11, BLACK);  // erase blob (uses h=2 pairs; driver safe)
+      // Down-pointing triangle via h=2 fillRects (CO5300 driver drops h=1 writes)
+      const int ay = icY - 6;
+      gfx->fillRect(icX - 9, ay +  0, 19, 2, arrowCol);
+      gfx->fillRect(icX - 8, ay +  2, 17, 2, arrowCol);
+      gfx->fillRect(icX - 6, ay +  4, 13, 2, arrowCol);
+      gfx->fillRect(icX - 5, ay +  6, 11, 2, arrowCol);
+      gfx->fillRect(icX - 4, ay +  8,  9, 2, arrowCol);
+      gfx->fillRect(icX - 3, ay + 10,  7, 2, arrowCol);
+      gfx->fillRect(icX - 1, ay + 12,  3, 2, arrowCol);
+    } else {
+      gfx->fillRect(icX - 9, icY - 6, 19, 14, BLACK);  // erase arrow bounding box
+      fillCircleFixed(icX, icY, 10, deviceConnected ? 0x07E0 : 0xF800);
+    }
+  }
 
   // Info panel — top half: cal preview; bottom half: WhoDat preview (full redraw only)
   if (fullRedraw) {
@@ -1121,7 +1150,7 @@ void drawWatchFace(bool fullRedraw) {
         int availChars = (LCD_WIDTH - safeL - DIST_COL_W) / CHAR_W;
         if ((int)name.length() > availChars) name = name.substring(0, availChars - 1) + "~";
 
-        gfx->setTextColor(0xFFE0, BLACK);
+        gfx->setTextColor(isSelfContact(name) ? 0x07FF : 0xFFE0, BLACK);
         gfx->setCursor(safeL, y);
         gfx->print(name);
 
@@ -1157,6 +1186,82 @@ void drawWatchFace(bool fullRedraw) {
 
 }
 
+// Cyan for Mik, Brenda, Horatio (known/self contacts); yellow for everyone else.
+static bool isSelfContact(const String &name) {
+  String nl = name; nl.toLowerCase(); nl += "/";
+  for (int s = 0; s < (int)nl.length(); ) {
+    int sl = nl.indexOf('/', s); if (sl < 0) break;
+    // Also split each segment on spaces so "Horatio Nelson" matches on "horatio"
+    String part = nl.substring(s, sl);
+    part += " ";
+    for (int p = 0; p < (int)part.length(); ) {
+      int sp = part.indexOf(' ', p); if (sp < 0) break;
+      String word = part.substring(p, sp); word.trim();
+      if (word == "mik" || word == "brenda" || word == "horatio") return true;
+      p = sp + 1;
+    }
+    s = sl + 1;
+  }
+  return false;
+}
+
+// ── Watch-face contacts zone — partial refresh (no full-screen clear) ─────────
+// Clears and redraws only the contacts strip below the cal divider.
+// Called from the CONTACTS: fast-path so simulation updates don't flash.
+void drawFaceContacts() {
+  const int infoBot = BTN_Y - 2;
+  gfx->fillRect(0, faceCalZoneBot + 1, LCD_WIDTH, infoBot - faceCalZoneBot, BLACK);
+
+  if (contactData.length() == 0) return;
+
+  gfx->setFont(nullptr);
+  gfx->setTextWrap(false);
+  gfx->setTextSize(2);
+
+  int y = faceCalZoneBot + 4;
+  int start = 0;
+  while (y + CHAR_DESCENT <= infoBot) {
+    int nl = contactData.indexOf('\n', start);
+    if (nl < 0) break;
+    String line = contactData.substring(start, nl);
+    line.trim();
+    start = nl + 1;
+    if (line.length() == 0) continue;
+    if (line.startsWith("BUY:") || line.startsWith("GOT:") || line.startsWith("HOME:")) continue;
+    int sep = line.indexOf('|');
+    if (sep < 0) continue;
+    String name = line.substring(0, sep);
+    String dist = line.substring(line.lastIndexOf('|') + 1);
+    dist.trim();
+
+    int safeL = MARGIN;
+    int yFromBot = LCD_HEIGHT - (y + CHAR_DESCENT);
+    if (yFromBot < CORNER_R) {
+      int dy2 = CORNER_R - yFromBot;
+      safeL = max(safeL, CORNER_R - (int)sqrtf((float)(CORNER_R*CORNER_R - dy2*dy2)) + 2);
+    }
+
+    int availChars = (LCD_WIDTH - safeL - DIST_COL_W) / CHAR_W;
+    if ((int)name.length() > availChars) name = name.substring(0, availChars - 1) + "~";
+
+    gfx->setTextColor(isSelfContact(name) ? 0x07FF : 0xFFE0, BLACK);
+    gfx->setCursor(safeL, y);
+    gfx->print(name);
+
+    if (dist.length() > 0) {
+      int16_t bx2, by2; uint16_t bw2, bh2;
+      gfx->getTextBounds(dist, 0, y, &bx2, &by2, &bw2, &bh2);
+      int distX = LCD_WIDTH - MARGIN - (int)bw2;
+      if (distX > safeL + (int)name.length() * CHAR_W + CHAR_W) {
+        gfx->setTextColor(0x07FF, BLACK);
+        gfx->setCursor(distX, y);
+        gfx->print(dist);
+      }
+    }
+    y += LINE_H;
+  }
+}
+
 // ── Contact list screen ───────────────────────────────────────────────────────
 void drawContactList(const String &payload) {
   gfx->fillScreen(BLACK);
@@ -1178,7 +1283,12 @@ void drawContactList(const String &payload) {
                             : payload.substring(start, nl);
     line.trim();
 
-    if (line.length() > 0) {
+    if (line.length() > 0 &&
+        !line.startsWith("TIME:") && !line.startsWith("CAL:") &&
+        !line.startsWith("WEATHER:") && !line.startsWith("LOST:") &&
+        !line.startsWith("CONTACTS:") && !line.startsWith("HOME:") &&
+        !line.startsWith("BUY:") && !line.startsWith("GOT:") &&
+        !line.startsWith("STEPS:") && !line.startsWith("AWAKE:")) {
       if (lineIndex >= scrollOffset) {
         if (linesDrawn >= 20 || y + CHAR_DESCENT > BTN_Y - 4) break;
 
@@ -1214,7 +1324,7 @@ void drawContactList(const String &payload) {
         else if (remaining > 0 && compact.length() > 0 && (int)compact.length() <= remaining)
           addrToShow = compact;
 
-        gfx->setTextColor(0xFFE0, BLACK);
+        gfx->setTextColor(isSelfContact(name) ? 0x07FF : 0xFFE0, BLACK);
         gfx->setCursor(MARGIN, y);
         gfx->print(name);
 
@@ -1426,6 +1536,30 @@ void setup() {
   pinMode(10, INPUT_PULLUP);   // PWR  button
   esp_wifi_stop();          // Wi-Fi radio unused — saves ~30mA
   setCpuFrequencyMhz(80);   // 240→80MHz; BLE requires ≥80MHz; saves ~25mA
+
+  // Start BLE advertising immediately — before display, audio, NVS, IMU — so
+  // the phone's scan can find the watch as soon as it powers on.
+  BLEDevice::init("Forget-me-not");
+  BLEDevice::setOwnAddrType(BLE_OWN_ADDR_RANDOM);
+  {
+    BLEServer *pServer = BLEDevice::createServer();
+    pServer->setCallbacks(new ServerCallbacks());
+    BLEService *pService = pServer->createService(NUS_SERVICE_UUID);
+    pTxChar = pService->createCharacteristic(NUS_TX_UUID, BLECharacteristic::PROPERTY_NOTIFY);
+    pTxChar->addDescriptor(new BLE2902());
+    BLECharacteristic *pRxChar = pService->createCharacteristic(
+      NUS_RX_UUID, BLECharacteristic::PROPERTY_WRITE);
+    pRxChar->setCallbacks(new RxCallbacks());
+    pService->start();
+    BLEAdvertising *pAdv = pServer->getAdvertising();
+    pAdv->addServiceUUID(NUS_SERVICE_UUID);
+    pAdv->setScanResponse(true);
+    pAdv->setMinInterval(0x20);   // 20ms — found quickly by Android scan
+    pAdv->setMaxInterval(0x40);   // 40ms
+    pAdv->start();
+  }
+  USBSerial.println("BLE advertising started");
+
   USBSerial.printf("Free heap:  %u bytes\n", ESP.getFreeHeap());
   USBSerial.printf("PSRAM size: %u bytes  free: %u bytes\n", ESP.getPsramSize(), ESP.getFreePsram());
 
@@ -1613,31 +1747,7 @@ void setup() {
     }
   }
 
-  BLEDevice::init("Forget-me-not");
-  BLEDevice::setOwnAddrType(BLE_OWN_ADDR_RANDOM);
-
-  BLEServer *pServer = BLEDevice::createServer();
-  pServer->setCallbacks(new ServerCallbacks());
-
-  BLEService *pService = pServer->createService(NUS_SERVICE_UUID);
-
-  pTxChar = pService->createCharacteristic(
-    NUS_TX_UUID, BLECharacteristic::PROPERTY_NOTIFY);
-  pTxChar->addDescriptor(new BLE2902());
-
-  BLECharacteristic *pRxChar = pService->createCharacteristic(
-    NUS_RX_UUID, BLECharacteristic::PROPERTY_WRITE);
-  pRxChar->setCallbacks(new RxCallbacks());
-
-  pService->start();
-
-  BLEAdvertising *pAdv = pServer->getAdvertising();
-  pAdv->addServiceUUID(NUS_SERVICE_UUID);
-  pAdv->setScanResponse(true);
-  pAdv->start();
-
   drawScreen("Open WhoDat\non your phone", false);
-  USBSerial.println("Advertising as 'Forget-me-not'");
   screenActivityMs = millis();  // start inactivity countdown from end of boot
 }
 
@@ -2069,6 +2179,34 @@ void loop() {
       goto listReadyDone;  // skip full-payload parse
     }
 
+    // ── STEPS: — refresh top row without full-screen clear ───────────────────────
+    if (contactList.startsWith("STEPS:")) {
+      stepCount += (uint32_t)contactList.substring(6).toInt();
+      if (currentMode == MODE_WATCH_FACE && screenOn) drawTopRow();
+      goto listReadyDone;
+    }
+
+    // ── AWAKE: — no watch-side action needed ─────────────────────────────────────
+    if (contactList.startsWith("AWAKE:")) {
+      goto listReadyDone;
+    }
+
+    // ── CONTACTS: fast-path — lightweight update sent every ~1s during simulated walk ──
+    if (contactList.startsWith("CONTACTS:\n")) {
+      contactData  = contactList.substring(10);  // strip "CONTACTS:\n" prefix
+      scrollOffset = 0;
+      syncFlashMs  = millis();
+      if (currentMode == MODE_WATCH_FACE && screenOn) {
+        drawWatchFace(false);    // redraws clock + icon immediately (no full-screen clear)
+        drawFaceContacts();      // redraws contacts zone with new data
+      } else if (currentMode == MODE_CONTACT_LIST) {
+        drawContactList(contactData);
+      } else {
+        watchFaceFullRedraw = true;
+      }
+      goto listReadyDone;
+    }
+
     scrollOffset = 0;
     // Parse leading TIME:HH:MM:SS|WD|DD|MM|YYYY line and sync PCF85063
     if (contactList.startsWith("TIME:")) {
@@ -2203,6 +2341,7 @@ void loop() {
     // Save clean contact lines for display (separate from the parse buffer)
     contactData = contactList;
     watchFaceFullRedraw = true;  // contacts or cal may have changed
+    syncFlashMs = millis();      // signal full-sync received; triggers sync arrow
 
     // Persist everything to NVS so it survives power cycles
     {
@@ -2258,20 +2397,21 @@ void loop() {
     listReadyDone: ;  // BUYDATA fast-path jumps here
   }
 
-  // Inactivity timeout — return to watch face (buy list uses left-swipe to exit)
-  if ((currentMode == MODE_CONTACT_LIST || currentMode == MODE_TAKE_LIST || currentMode == MODE_CAL_LIST) &&
+  // Inactivity timeout — return to watch face (buy list uses left-swipe to exit).
+  // Contact list has no timeout — press Back to return; it can be left open during simulation.
+  if ((currentMode == MODE_TAKE_LIST || currentMode == MODE_CAL_LIST) &&
       millis() - lastInteractionMs > INACTIVITY_MS) {
     currentMode         = MODE_WATCH_FACE;
     watchFaceFullRedraw = true;
     lastWatchSecond     = -1;
   }
 
-  if (screenOn && millis() - screenActivityMs > SLEEP_MS) {
+  if (!usbPowered && screenOn && millis() - screenActivityMs > SLEEP_MS) {
     gfx->displayOff();
     screenOn = false;
   }
 
-  if (!screenOn && millis() - bleConnectMs > BLE_HANDSHAKE_GRACE_MS) {
+  if (!usbPowered && !screenOn && millis() - bleConnectMs > BLE_HANDSHAKE_GRACE_MS) {
     gpio_wakeup_enable((gpio_num_t)TP_INT, GPIO_INTR_LOW_LEVEL);
     esp_sleep_enable_gpio_wakeup();
     esp_sleep_enable_timer_wakeup(BLE_POLL_MS * 1000ULL);
@@ -2286,9 +2426,11 @@ void loop() {
     static unsigned long lastFaceMs = 0;
     unsigned long now = millis();
     if (watchFaceFullRedraw || now - lastFaceMs >= 950) {
-      lastFaceMs          = now;
+      lastFaceMs = now;
+      bool wasFullRedraw  = watchFaceFullRedraw;
       drawWatchFace(watchFaceFullRedraw);
       watchFaceFullRedraw = false;
+      if (wasFullRedraw) drawFaceContacts();  // repaint contacts after full-screen clear
     }
   }
 
@@ -2368,6 +2510,13 @@ void loop() {
       } else {
         USBSerial.printf("Batt poll: I2C endTransmission failed, status=%u\n", txStatus);
       }
+    }
+    // AXP2101 STATUS1 reg 0x00 bit 5 = VBUS_GD (USB power present)
+    Wire.beginTransmission(AXP2101_ADDR);
+    Wire.write(0x00);
+    if (Wire.endTransmission(false) == 0) {
+      Wire.requestFrom((uint8_t)AXP2101_ADDR, (uint8_t)1);
+      if (Wire.available()) usbPowered = (Wire.read() & 0x20) != 0;
     }
   }
 
